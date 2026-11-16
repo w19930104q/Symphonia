@@ -76,6 +76,8 @@ pub use dec3::Dec3Atom;
 pub use dovi::DoviAtom;
 pub use edts::EdtsAtom;
 pub use elst::ElstAtom;
+#[cfg(test)]
+pub use elst::ElstEntry;
 pub use esds::EsdsAtom;
 pub use flac::FlacAtom;
 pub use ftyp::FtypAtom;

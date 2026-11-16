@@ -8,7 +8,6 @@
 use crate::atoms::{Atom, AtomHeader, AtomIterator, AtomType, ElstAtom, ReadAtom, Result};
 
 /// Edits atom.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct EdtsAtom {
     pub elst: Option<ElstAtom>,

@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::atoms::{AtomError, AtomIterator, AtomType, ReadAtom};
 use crate::atoms::{FtypAtom, MetaAtom, MoofAtom, MoovAtom, SidxAtom, TrakAtom};
+use crate::edits::{EditCursor, EditList, edit_list_for_track};
 use crate::stream::*;
 
 use log::{debug, info, trace, warn};
@@ -46,10 +47,17 @@ pub struct TrackState {
     next_sample: u32,
     /// The current sample byte position relative to the start of the track.
     next_sample_pos: u64,
+    /// The normalized edit list of the track, if the track has one.
+    edits: Option<EditCursor>,
 }
 
 impl TrackState {
-    pub fn make(track_num: usize, trak: &TrakAtom, timespan: &TimeSpan) -> (Self, Track) {
+    pub fn make(
+        track_num: usize,
+        trak: &TrakAtom,
+        timespan: &TimeSpan,
+        edits: Option<Arc<EditList>>,
+    ) -> (Self, Track) {
         let mut track = Track::new(trak.tkhd.id);
 
         // Create the codec parameters using the sample description atom.
@@ -57,19 +65,34 @@ impl TrackState {
             track.with_codec_params(codec_params);
         }
 
+        // The duration and timebase of the track follow the edit list when one is present. The
+        // edit list is normalized to the media timescale so the timebase remains the reciprocal of
+        // the media timescale.
+        let duration = match &edits {
+            Some(edit_list) => edit_list.duration(),
+            None => timespan.duration,
+        };
+
         // Populate timing information.
-        track
-            .with_time_base(TimeBase::from_recip(timespan.timescale))
-            .with_duration(timespan.duration);
+        track.with_time_base(TimeBase::from_recip(timespan.timescale)).with_duration(duration);
+
+        // The first packet of a track with edits does not necessarily start at timestamp 0 (for
+        // example, when the edit list begins with an empty edit).
+        if let Some(edit_list) = &edits {
+            track.with_start_ts(Timestamp::new(edit_list.first_presentation_ts() as i64));
+        }
 
         // If the track is an audio track, and the timescale is equal to the sample rate, then the
         // number of frames is equal to the duration. This is the case for almost all audio tracks.
         // If not, there is no generic, low overhead, & precise way to determine the number of
-        // frames.
-        if let Some(CodecParameters::Audio(audio)) = &track.codec_params {
-            if let Some(sample_rate) = audio.sample_rate {
-                if sample_rate == timespan.timescale.get() {
-                    track.with_num_frames(timespan.duration.get());
+        // frames. The number of playable frames cannot be derived from the duration when edits are
+        // present because empty edits and looping edits do not map 1:1 to media samples.
+        if edits.is_none() {
+            if let Some(CodecParameters::Audio(audio)) = &track.codec_params {
+                if let Some(sample_rate) = audio.sample_rate {
+                    if sample_rate == timespan.timescale.get() {
+                        track.with_num_frames(duration.get());
+                    }
                 }
             }
         }
@@ -80,9 +103,38 @@ impl TrackState {
             cur_seg: 0,
             next_sample: 0,
             next_sample_pos: 0,
+            edits: edits.map(EditCursor::new),
         };
 
         (state, track)
+    }
+
+    /// Returns `true` if the track has an edit list and all its edits have been presented.
+    fn edits_exhausted(&self) -> bool {
+        self.edits.as_ref().is_some_and(|edits| edits.is_at_end())
+    }
+
+    /// Maps the media timestamp of the next sample to a presentation timestamp according to the
+    /// track's edit list.
+    ///
+    /// If the sample is not part of the presentation timeline (for example, it lies in a region
+    /// skipped by the edit list), the sample index is advanced and `None` is returned so the caller
+    /// can retry with the next sample. When the track has no edit list the media timestamp is
+    /// returned unchanged.
+    fn map_next_sample_ts(&mut self, media_ts: u64) -> Option<u64> {
+        match self.edits.as_mut() {
+            Some(edits) => edits.presentation_ts_for_media_ts(media_ts),
+            None => Some(media_ts),
+        }
+    }
+
+    /// Clamps the duration of a sample so packets never extend past the end of an edit. Without an
+    /// edit list the duration is returned unchanged.
+    fn clamp_sample_dur(&self, media_ts: u64, dur: u32) -> u32 {
+        match self.edits.as_ref() {
+            Some(edits) => edits.clamp_sample_duration(media_ts, u64::from(dur)) as u32,
+            None => dur,
+        }
     }
 }
 
@@ -306,16 +358,33 @@ impl<'s> IsoMp4Reader<'s> {
             }
             else {
                 // If non-fragmented, use the total duration (media timescale) from the track's
-                // stts atom. Since edits are not currently supported, this is the duration of all
-                // samples that will be yielded.
-                //
-                // TODO: Support edits. Once supported, prefer the tkhd duration.
+                // stts atom. When the track has no edits this is the duration of all samples that
+                // will be yielded. If edits are present, the edit list is used to determine the
+                // presentation duration instead.
                 let duration = Duration::from(trak.mdia.minf.stbl.stts.total_duration);
 
                 TimeSpan::new(trak.mdia.mdhd.timescale, duration)
             };
 
-            let (track_state, track) = TrackState::make(t, trak, &timespan);
+            // Build the normalized edit list for the track, if one is present. Edit lists are only
+            // supported for non-fragmented tracks because fragmented tracks are streamed and their
+            // full extent is not known upfront.
+            let edits = if moov.is_fragmented() {
+                if trak.edts.is_some() {
+                    warn!("isomp4: edit lists are not supported for fragmented tracks, ignoring.");
+                }
+                None
+            }
+            else {
+                edit_list_for_track(
+                    trak.edts.as_ref(),
+                    moov.mvhd.timescale.get(),
+                    trak.mdia.mdhd.timescale.get(),
+                    trak.mdia.minf.stbl.stts.total_duration,
+                )?
+            };
+
+            let (track_state, track) = TrackState::make(t, trak, &timespan, edits);
 
             tracks.push(track);
             track_states.push(track_state);
@@ -343,23 +412,68 @@ impl<'s> IsoMp4Reader<'s> {
 
     /// Idempotently gets information regarding the next sample of the media stream. This function
     /// selects the next sample with the lowest timestamp of all tracks.
-    fn next_sample_info(&self) -> Result<Option<NextSampleInfo>> {
+    fn next_sample_info(&mut self) -> Result<Option<NextSampleInfo>> {
         let mut earliest = None;
 
         // TODO: Consider returning samples based on lowest byte position in the track instead of
         // timestamp. This may be important if video tracks are ever decoded (i.e., DTS vs. PTS).
 
-        for (state, track) in self.track_states.iter().zip(&self.tracks) {
+        for track_num in 0..self.track_states.len() {
+            // A track with a fully consumed edit list has no more samples to present.
+            if self.track_states[track_num].edits_exhausted() {
+                continue;
+            }
+
             // Get the timebase of the track used to calculate the presentation time.
-            let tb = track.time_base.expect("track always created with a timebase");
+            let tb =
+                self.tracks[track_num].time_base.expect("track always created with a timebase");
+
+            let state = &mut self.track_states[track_num];
+            let cur_seg = state.cur_seg;
+            let mut sample_num = state.next_sample;
 
             // Get the next timestamp for the next sample of the current track. The next sample may
-            // be in a future segment.
-            for (seg_idx_delta, seg) in self.segs[state.cur_seg..].iter().enumerate() {
-                // Try to get the timestamp for the next sample of the track from the segment.
-                if let Some(timing) = seg.sample_timing(state.track_num, state.next_sample)? {
+            // be in a future segment. Samples that are not part of the track's presentation
+            // timeline (due to the edit list) are skipped.
+            loop {
+                // `found` is true when a presentable sample was located. `out_of_samples` stays true
+                // only when no segment contains the candidate sample number, meaning the media
+                // itself has been exhausted.
+                let mut found = false;
+                let mut out_of_samples = true;
+
+                for (seg_idx_delta, seg) in self.segs[cur_seg..].iter().enumerate() {
+                    // Try to get the timestamp for the next sample of the track from the segment.
+                    let Some(timing) = seg.sample_timing(track_num, sample_num)?
+                    else {
+                        // The sample is not in this segment, try the next one.
+                        continue;
+                    };
+
+                    // A segment contains the candidate, so the media is not exhausted.
+                    out_of_samples = false;
+
+                    // Apply the edit list to map the media timestamp to a presentation
+                    // timestamp.
+                    let Some(pts) = self.track_states[track_num].map_next_sample_ts(timing.ts)
+                    else {
+                        // The sample exists but is not presented by the edit list. Advance to the
+                        // next sample and retry the segment scan. This must not trigger a rewind:
+                        // skipped samples may simply precede the first presented sample.
+                        sample_num += 1;
+                        self.track_states[track_num].next_sample = sample_num;
+                        break;
+                    };
+
+                    // Clamp the sample duration to the extent of the edit containing it.
+                    let dur = self.track_states[track_num].clamp_sample_dur(timing.ts, timing.dur);
+
+                    // Remember the sample number to resume from on the next call when the
+                    // current sample is skipped by the edit list.
+                    self.track_states[track_num].next_sample = sample_num;
+
                     // Calculate the presentation time using the timestamp.
-                    let Some(ts) = timing.ts.try_into().ok()
+                    let Some(ts) = Timestamp::try_from(pts).ok()
                     else {
                         return Ok(None);
                     };
@@ -369,8 +483,10 @@ impl<'s> IsoMp4Reader<'s> {
                         return Ok(None);
                     };
 
-                    // Compare the presentation time of the sample from this track to other tracks,
-                    // and select the track with the earliest presentation time.
+                    let seg_idx = cur_seg + seg_idx_delta;
+
+                    // Compare the presentation time of the sample from this track to other
+                    // tracks, and select the track with the earliest presentation time.
                     match earliest {
                         Some(NextSampleInfo { time, .. }) if time <= sample_time => {
                             // Earliest is less than or equal to the track's next sample
@@ -380,21 +496,45 @@ impl<'s> IsoMp4Reader<'s> {
                             // Earliest was either None, or greater than the track's next sample
                             // presentation time. Update earliest.
                             earliest = Some(NextSampleInfo {
-                                track_num: state.track_num,
-                                track_id: state.track_id,
+                                track_num,
+                                track_id: self.track_states[track_num].track_id,
                                 ts,
                                 time: sample_time,
-                                dur: Duration::from(timing.dur),
-                                seg_idx: seg_idx_delta + state.cur_seg,
+                                dur: Duration::from(dur),
+                                seg_idx,
                             });
                         }
                     }
 
-                    // Either the next sample of the track had the earliest presentation time seen
-                    // thus far, or it was greater than those from other tracks, but there is no
-                    // reason to check samples in future segments.
+                    found = true;
                     break;
                 }
+
+                if found {
+                    break;
+                }
+
+                // A presentable sample was not found on this pass. When the candidate sample exists
+                // but is simply skipped by the edit list, advance to the next sample and retry. A
+                // rewind is only appropriate when the media itself has been exhausted (no segment
+                // contains the candidate): looping edit lists then replay the media. The edit
+                // cursor only ever advances through the edit list, so once every edit is consumed
+                // the track ends and the rewind cannot loop forever.
+                if !out_of_samples {
+                    continue;
+                }
+
+                if sample_num == 0
+                    || self.track_states[track_num].edits.is_none()
+                    || self.track_states[track_num].edits_exhausted()
+                {
+                    break;
+                }
+
+                sample_num = 0;
+                let state = &mut self.track_states[track_num];
+                state.next_sample = 0;
+                state.next_sample_pos = 0;
             }
         }
 
@@ -522,13 +662,42 @@ impl<'s> IsoMp4Reader<'s> {
             return seek_error(SeekErrorKind::OutOfRange);
         }
 
+        // For tracks with an edit list, the requested timestamp is on the presentation timeline.
+        // Map it to the corresponding media timestamp and reposition the edit cursor. The seek then
+        // proceeds on the media timeline, while the reported actual timestamp is on the
+        // presentation timeline.
+        let media_ts = {
+            let state = &mut self.track_states[track_num];
+
+            match state.edits.as_mut() {
+                Some(edits) => {
+                    let requested = ts.get() as u64;
+
+                    if requested >= edits.duration().get() {
+                        return seek_error(SeekErrorKind::OutOfRange);
+                    }
+
+                    // A timestamp inside an empty edit is resolved to the start of the following
+                    // media edit by the cursor. When the remainder of the presentation timeline
+                    // contains only empty edits there is nothing to play.
+                    match edits.seek_to_presentation_ts(requested) {
+                        Some(media_ts) => media_ts,
+                        None => return seek_error(SeekErrorKind::OutOfRange),
+                    }
+                }
+                None => ts.get() as u64,
+            }
+        };
+
+        let mut presentation_actual: Option<Timestamp> = None;
+
         let mut seg_skip = 0;
 
         let seek_loc = 'locate: loop {
             // Iterate over all segments and attempt to find the segment and sample number that
             // contains the desired timestamp. Skip segments already examined.
             for (seg_idx, seg) in self.segs.iter().enumerate().skip(seg_skip) {
-                if let Some(sample_num) = seg.ts_sample(track_num, ts.get() as u64)? {
+                if let Some(sample_num) = seg.ts_sample(track_num, media_ts)? {
                     break 'locate SeekLocation { seg_idx, sample_num };
                 }
 
@@ -550,10 +719,26 @@ impl<'s> IsoMp4Reader<'s> {
             None => return seek_error(SeekErrorKind::OutOfRange),
         };
 
-        // Try to convert the sample timing to a timestamp.
-        let actual_ts = match Timestamp::try_from(timing.ts) {
-            Ok(ts) => ts,
-            _ => return seek_error(SeekErrorKind::OutOfRange),
+        // The sample timing is on the media timeline. When an edit list is present, map it back to
+        // the presentation timeline to report the actual seeked-to timestamp.
+        if self.track_states[track_num].edits.is_some() {
+            let state = &self.track_states[track_num];
+            let edits = state.edits.as_ref().expect("edit list presence checked above");
+
+            presentation_actual = match edits.seek_map_media_ts(timing.ts) {
+                Some((_, Some(presentation_ts))) => Some(Timestamp::new(presentation_ts as i64)),
+                // The seeked sample lies inside an empty edit; report the requested presentation
+                // timestamp instead (already computed above).
+                _ => presentation_actual.or(Some(ts)),
+            };
+        }
+
+        let actual_ts = match presentation_actual {
+            Some(ts) => ts,
+            None => match Timestamp::try_from(timing.ts) {
+                Ok(ts) => ts,
+                _ => return seek_error(SeekErrorKind::OutOfRange),
+            },
         };
 
         // Get the sample information.

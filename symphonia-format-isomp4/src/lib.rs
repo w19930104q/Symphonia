@@ -15,6 +15,7 @@
 
 mod atoms;
 mod demuxer;
+mod edits;
 mod fp;
 mod stream;
 

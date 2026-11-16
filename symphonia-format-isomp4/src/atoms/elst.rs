@@ -11,20 +11,36 @@ use crate::atoms::{Atom, AtomHeader, AtomIterator, ReadAtom, Result};
 use crate::atoms::{decode_error, limits::*};
 
 /// Edit list entry.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ElstEntry {
-    segment_duration: u64,
-    media_time: i64,
-    media_rate_int: i16,
-    media_rate_frac: i16,
+    /// The duration of the edit in the movie's (mvhd) timescale units.
+    pub segment_duration: u64,
+    /// The starting time within the media of this edit in the media's (mdhd) timescale units. If
+    /// -1, the edit is an empty (silence/blank) edit.
+    pub media_time: i64,
+    /// The integer part of the media playback rate.
+    pub media_rate_int: i16,
+    /// The fractional part of the media playback rate.
+    pub media_rate_frac: i16,
+}
+
+impl ElstEntry {
+    /// Returns `true` if this is an empty edit. An empty edit presents no media and is rendered as
+    /// silence (audio) or a blank frame (video).
+    pub fn is_empty_edit(&self) -> bool {
+        self.media_time == -1
+    }
+
+    /// Returns `true` if the edit plays the media at the normal rate (1.0).
+    pub fn is_normal_rate(&self) -> bool {
+        self.media_rate_int == 1 && self.media_rate_frac == 0
+    }
 }
 
 /// Edit list atom.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ElstAtom {
-    entries: Vec<ElstEntry>,
+    pub entries: Vec<ElstEntry>,
 }
 
 impl Atom for ElstAtom {
