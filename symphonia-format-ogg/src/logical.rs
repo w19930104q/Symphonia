@@ -238,11 +238,17 @@ impl LogicalStream {
                     // If the stream does not start at t = 0, then it is not possible to determine
                     // whether frames should be discarded from the start or the end of the stream.
                     // Therefore, we assume t = 0 for the remainder.
-                    let total_dur_no_padding =
-                        match total_pkt_discard.checked_add((page_end_ts.get() as u64).into()) {
-                            Some(v) => v,
-                            None => return decode_error("ogg: duration overflow"),
-                        };
+                    //
+                    // A negative page end timestamp means there are no valid frames relative to
+                    // t = 0, so treat the valid portion as zero length rather than casting the
+                    // timestamp to a huge unsigned value.
+                    let valid_frames =
+                        page_end_ts.duration_from(Timestamp::ZERO).unwrap_or(Duration::ZERO);
+
+                    let total_dur_no_padding = match total_pkt_discard.checked_add(valid_frames) {
+                        Some(v) => v,
+                        None => return decode_error("ogg: duration overflow"),
+                    };
 
                     if total_pkt_dur >= total_dur_no_padding {
                         // The total packet duration is >= delay + valid (assuming t = 0) frames,
@@ -494,19 +500,27 @@ impl LogicalStream {
 
         // If this is the last page, update the codec parameters.
         if page.header.is_last_page {
-            // TODO: What if this is negative?
-            // TODO: Bounds are in timestamp units, not number of frames. Fix this up because it
-            // only works for audio codecs.
-            let num_frames = bound.ts.get() as u64;
-            let num_padding_frames = bound.discard.get() as u32;
-
             let track = self.mapper.track_mut();
 
-            track.with_num_frames(num_frames);
-            track.with_duration(Duration::from(num_frames));
+            // The number of playable frames is the distance between the start and end bounds. The
+            // end timestamp may legitimately be negative (for example, when a stream contains only
+            // encoder delay), so it must not be cast to an unsigned frame count directly.
+            //
+            // Bounds are measured in the track's timebase units. For the supported audio codecs
+            // one timebase tick is one audio frame, so the frame count equals the duration. If the
+            // start bound is not known, or the end bound precedes it, the frame count cannot be
+            // determined.
+            let num_frames = self.start_bound.and_then(|start| bound.ts.duration_from(start.ts));
 
-            if num_padding_frames > 0 {
-                track.with_padding(num_padding_frames);
+            if let Some(num_frames) = num_frames {
+                track.with_num_frames(num_frames.get());
+                track.with_duration(num_frames);
+            }
+
+            // End delay (padding) is measured in frames, which are the same units as the timebase
+            // for audio codecs.
+            if bound.discard > Duration::ZERO {
+                track.with_padding(bound.discard.get() as u32);
             }
 
             self.end_bound = Some(bound);
