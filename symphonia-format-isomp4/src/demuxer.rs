@@ -248,6 +248,74 @@ impl<'s> IsoMp4Reader<'s> {
             return unsupported_error("isomp4: missing moov atom");
         }
 
+        let mut moov = moov.expect("moov is checked for None above");
+
+        // The number of tracks specified in the moov atom must match the number in the mvex atom.
+        // This must be checked before the fragment scan below since fragments are associated with
+        // tracks by their index within the mvex atom.
+        if let Some(mvex) = &moov.mvex {
+            if mvex.trexs.len() != moov.traks.len() {
+                return decode_error("isomp4: mvex and moov track number mismatch");
+            }
+        }
+
+        if moov.is_fragmented() {
+            if !sidx_timespans.is_empty() {
+                info!("stream is segmented with a segment index.");
+            }
+            else {
+                info!("stream is segmented without a segment index.");
+            }
+        }
+
+        if let Some(rev) = moov.take_metadata() {
+            metadata.push(rev);
+        }
+
+        // The moov atom will be shared among all segments and the demuxer using an Arc.
+        let moov = Arc::new(moov);
+
+        // If the stream is fragmented and the source is seekable, scan all movie fragments and
+        // total the per-track sample counts and durations. The totals are accumulated with the
+        // same logic used to sequence fragments during playback, so the track durations derived
+        // from them are guaranteed to match the addressable ranges used when seeking. Neither the
+        // sidx atom (which is non-authoritative) nor the mdhd atom (which is usually 0 for
+        // fragmented streams) can provide this guarantee.
+        let frag_totals = if moov.is_fragmented() && is_seekable {
+            // Rewind to the start of the stream and iterate over all top-level atoms.
+            let mut mss = it.into_inner();
+            mss.seek(SeekFrom::Start(0))?;
+            it = AtomIterator::new(mss, total_len);
+
+            let mut totals = FragmentTotals::new(moov.traks.len());
+
+            loop {
+                match it.next_header() {
+                    Ok(Some(header)) => {
+                        if header.atom_type() == AtomType::MovieFragment {
+                            match it.read_atom::<MoofAtom>() {
+                                Ok(moof) => totals.add_moof(moof, &moov),
+                                Err(_) => {
+                                    warn!("isomp4: fragment scan stopped at invalid moof atom.");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        warn!("isomp4: fragment scan stopped early.");
+                        break;
+                    }
+                }
+            }
+
+            Some(totals)
+        }
+        else {
+            None
+        };
+
         // If the top-level atom scan iterated across the entire source (e.g., if moov was the last
         // atom), then the iterator must return to the first moof or mdat atom. This is only
         // possible if the source is seekable. If it's not, then the media will be effectively
@@ -273,21 +341,6 @@ impl<'s> IsoMp4Reader<'s> {
             }
         }
 
-        let mut moov = moov.expect("moov is checked for None above");
-
-        if moov.is_fragmented() {
-            if !sidx_timespans.is_empty() {
-                info!("stream is segmented with a segment index.");
-            }
-            else {
-                info!("stream is segmented without a segment index.");
-            }
-        }
-
-        if let Some(rev) = moov.take_metadata() {
-            metadata.push(rev);
-        }
-
         // Create a track and track state for each Track (trak) atom.
         let mut tracks = Vec::with_capacity(moov.traks.len());
         let mut track_states = Vec::with_capacity(moov.traks.len());
@@ -295,14 +348,27 @@ impl<'s> IsoMp4Reader<'s> {
         for (t, trak) in moov.traks.iter().enumerate() {
             // Determine the timespan of the track.
             let timespan = if moov.is_fragmented() {
-                // If fragmented, prefer the duration from the sidx, if it is provided. Otherwise,
-                // fallback to the mdhd.
-                sidx_timespans
-                    .get(&trak.tkhd.id)
-                    .map(|sidx_tspan| TimeSpan::new(sidx_tspan.timescale, sidx_tspan.duration))
-                    .unwrap_or_else(|| {
-                        TimeSpan::new(trak.mdia.mdhd.timescale, trak.mdia.mdhd.duration.into())
-                    })
+                if let Some(totals) = &frag_totals {
+                    // The fragments were scanned. The duration of the track is the total
+                    // duration of all its fragments. Since the totals are accumulated with the
+                    // same logic that computes the addressable ranges of the fragments, the
+                    // duration of the track is exactly the end of its addressable timestamp
+                    // range.
+                    TimeSpan::new(
+                        trak.mdia.mdhd.timescale,
+                        Duration::from(totals.total_duration(t)),
+                    )
+                }
+                else {
+                    // The fragments could not be scanned. Prefer the duration from the sidx,
+                    // if it is provided. Otherwise, fallback to the mdhd.
+                    sidx_timespans
+                        .get(&trak.tkhd.id)
+                        .map(|sidx_tspan| TimeSpan::new(sidx_tspan.timescale, sidx_tspan.duration))
+                        .unwrap_or_else(|| {
+                            TimeSpan::new(trak.mdia.mdhd.timescale, trak.mdia.mdhd.duration.into())
+                        })
+                }
             }
             else {
                 // If non-fragmented, use the total duration (media timescale) from the track's
@@ -320,16 +386,6 @@ impl<'s> IsoMp4Reader<'s> {
             tracks.push(track);
             track_states.push(track_state);
         }
-
-        // The number of tracks specified in the moov atom must match the number in the mvex atom.
-        if let Some(mvex) = &moov.mvex {
-            if mvex.trexs.len() != moov.traks.len() {
-                return decode_error("isomp4: mvex and moov track number mismatch");
-            }
-        }
-
-        // The moov atom will be shared among all segments and the demuxer using an Arc.
-        let moov = Arc::new(moov);
 
         let segs: Vec<Box<dyn StreamSegment>> = vec![Box::new(MoovSegment::new(moov.clone()))];
 

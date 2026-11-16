@@ -329,6 +329,78 @@ fn get_chunk_offset(
     }
 }
 
+/// Per-track totals accumulated across the movie fragments (moof atoms) of a fragmented
+/// stream.
+///
+/// The totals are accumulated by feeding each fragment through the same `MoofSegment`
+/// sequencing logic the demuxer uses when reading fragments incrementally. Therefore, the
+/// accumulated totals are, by construction, exactly the ends of the addressable sample and
+/// timestamp ranges of each track.
+pub struct FragmentTotals {
+    /// Per-track total sample count. This is the end of the track's addressable sample range.
+    sample_counts: Vec<u32>,
+    /// Per-track total duration in the track's timescale units. This is the end of the track's
+    /// addressable timestamp range.
+    durations: Vec<u64>,
+}
+
+impl FragmentTotals {
+    /// Instantiate a new accumulator for `num_tracks` tracks.
+    pub fn new(num_tracks: usize) -> Self {
+        FragmentTotals { sample_counts: vec![0; num_tracks], durations: vec![0; num_tracks] }
+    }
+
+    /// Gets the total duration of the track `track_num` across all added fragments.
+    pub fn total_duration(&self, track_num: usize) -> u64 {
+        self.durations[track_num]
+    }
+
+    /// Adds the samples of a movie fragment atom to the totals.
+    pub fn add_moof(&mut self, moof: MoofAtom, moov: &Arc<MoovAtom>) {
+        // Sequence the fragment as-if it was the next segment of the stream.
+        let seg = MoofSegment::new(moof, moov.clone(), self);
+
+        // The ends of the segment's sample and timestamp ranges are the new totals.
+        for track_num in 0..self.sample_counts.len() {
+            self.sample_counts[track_num] = seg.track_sample_range(track_num).end;
+            self.durations[track_num] = seg.track_ts_range(track_num).end;
+        }
+    }
+}
+
+impl StreamSegment for FragmentTotals {
+    fn sequence_num(&self) -> u32 {
+        0
+    }
+
+    fn all_tracks_ended(&self) -> bool {
+        false
+    }
+
+    fn track_sample_range(&self, track_num: usize) -> Range<u32> {
+        self.sample_counts[track_num]..self.sample_counts[track_num]
+    }
+
+    fn track_ts_range(&self, track_num: usize) -> Range<u64> {
+        self.durations[track_num]..self.durations[track_num]
+    }
+
+    fn sample_timing(&self, _: usize, _: u32) -> Result<Option<SampleTiming>> {
+        // Only the range ends are used when sequencing fragments. Nothing to return.
+        Ok(None)
+    }
+
+    fn ts_sample(&self, _: usize, _: u64) -> Result<Option<u32>> {
+        // Only the range ends are used when sequencing fragments. Nothing to return.
+        Ok(None)
+    }
+
+    fn sample_data(&self, _: usize, _: u32, _: bool) -> Result<SampleDataDesc> {
+        // Only the range ends are used when sequencing fragments. There is no sample data.
+        decode_error("isomp4: invalid sample index")
+    }
+}
+
 pub struct MoovSegment {
     moov: Arc<MoovAtom>,
 }
