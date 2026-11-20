@@ -196,6 +196,19 @@ pub enum FormatData {
     Extensible(FormatExtensible),
     ALaw(FormatALaw),
     MuLaw(FormatMuLaw),
+    /// MPEG audio (layers 1, 2, and 3) embedded directly in the data chunk. The container does not
+    /// packetize the stream, so the demuxer re-syncs to each MPEG frame instead of using the
+    /// block-based packetization shared by the other WAVE codecs.
+    Mpeg(FormatMpeg),
+}
+
+/// Format data for an MPEG audio stream embedded in a WAVE container.
+pub struct FormatMpeg {
+    /// Channel bitmask.
+    pub channels: Channels,
+    /// Codec ID. The MPEG format tags do not identify the layer unambiguously, so the actual codec
+    /// is determined from the first MPEG frame in the data chunk.
+    pub codec: AudioCodecId,
 }
 
 pub struct FormatPcm {
@@ -464,6 +477,11 @@ pub fn append_format_params(
         }
         FormatData::MuLaw(mulaw) => {
             codec_params.for_codec(mulaw.codec).with_channels(mulaw.channels);
+        }
+        FormatData::Mpeg(mpeg) => {
+            // The sample rate is taken from the Format chunk, while the channel layout and codec
+            // are confirmed against the actual MPEG frames while packetizing the data chunk.
+            codec_params.for_codec(mpeg.codec).with_channels(mpeg.channels);
         }
     }
 }

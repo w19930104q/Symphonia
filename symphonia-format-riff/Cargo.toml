@@ -29,5 +29,8 @@ path = "../symphonia-metadata"
 default-features = false
 features = []
 
+[dev-dependencies]
+symphonia-bundle-mp3 = { version = "0.6.1", path = "../symphonia-bundle-mp3" }
+
 [lints]
 workspace = true

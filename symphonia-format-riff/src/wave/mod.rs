@@ -22,10 +22,13 @@ use symphonia_core::support_format;
 use log::{debug, error};
 
 use crate::common::{
-    ByteOrder, ChunksReader, PacketInfo, append_data_params, append_format_params, next_packet,
+    ByteOrder, ChunksReader, FormatData, PacketInfo, append_data_params, append_format_params,
+    next_packet,
 };
 mod chunks;
 use chunks::*;
+mod mpeg;
+use mpeg::MpegPacketizer;
 
 /// WAVE is actually a RIFF stream, with a "RIFF" ASCII stream marker.
 const WAVE_STREAM_MARKER: [u8; 4] = *b"RIFF";
@@ -53,7 +56,10 @@ pub struct WavReader<'s> {
     tracks: Vec<Track>,
     chapters: Option<ChapterGroup>,
     metadata: MetadataLog,
-    packet_info: PacketInfo,
+    /// Block-based packetization used by PCM and the other fixed-block WAVE codecs.
+    packet_info: Option<PacketInfo>,
+    /// Frame-based packetization used by MPEG audio embedded in the data chunk.
+    mpeg_packetizer: Option<MpegPacketizer>,
     data_start_pos: u64,
     data_end_pos: Option<u64>,
 }
@@ -96,6 +102,7 @@ impl<'s> WavReader<'s> {
         let mut codec_params = AudioCodecParameters::new();
         let mut metadata: MetadataLog = Default::default();
         let mut packet_info = None;
+        let mut is_mpeg = false;
         let mut fact = None;
 
         loop {
@@ -112,17 +119,23 @@ impl<'s> WavReader<'s> {
                 RiffWaveChunks::Format(fmt) => {
                     let format = fmt.parse(&mut mss)?;
 
-                    // The Format chunk contains the block_align field and possible additional
-                    // information to handle packetization and seeking.
-                    let info = format.packet_info()?;
-                    codec_params
-                        .with_max_frames_per_packet(info.max_frames_per_packet.get())
-                        .with_frames_per_block(info.frames_per_block.get());
+                    is_mpeg = matches!(format.format_data, FormatData::Mpeg(_));
+
+                    // MPEG audio is a self-framing stream and does not use the block-based
+                    // packetization shared by the other WAVE codecs.
+                    if !is_mpeg {
+                        // The Format chunk contains the block_align field and possible additional
+                        // information to handle packetization and seeking.
+                        let info = format.packet_info()?;
+                        codec_params
+                            .with_max_frames_per_packet(info.max_frames_per_packet.get())
+                            .with_frames_per_block(info.frames_per_block.get());
+
+                        packet_info = Some(info);
+                    }
 
                     // Append Format chunk fields to codec parameters.
                     append_format_params(&mut codec_params, format.format_data, format.sample_rate);
-
-                    packet_info = Some(info);
                 }
                 RiffWaveChunks::Fact(fct) => {
                     fact = Some(fct.parse(&mut mss)?);
@@ -149,6 +162,85 @@ impl<'s> WavReader<'s> {
 
                     track.with_codec_params(CodecParameters::Audio(codec_params));
 
+                    // MPEG audio is packetized by re-syncing to each frame rather than by fixed
+                    // blocks.
+                    if is_mpeg {
+                        // Clamp the data chunk's end to the actual media source length. A WAVE may
+                        // declare a data chunk longer than the bytes actually present (e.g. a
+                        // truncated file), and packetizing past the real end of the source would
+                        // fail with an unexpected EOF.
+                        let data_end_pos = match (data_end_pos, mss.byte_len()) {
+                            (Some(end), Some(len)) => Some(end.min(len)),
+                            (end, _) => end,
+                        };
+
+                        let packetizer = MpegPacketizer::new(data_start_pos, data_end_pos);
+
+                        // Confirm the codec and sample rate against the first actual frame. The
+                        // MPEG format tags do not identify the layer unambiguously.
+                        let first_header =
+                            MpegPacketizer::peek_first_header(&mut mss, data_end_pos)?;
+
+                        if let Some(CodecParameters::Audio(params)) = track.codec_params.as_mut() {
+                            params.for_codec(first_header.codec());
+
+                            // The Format chunk sample rate should match the frame header, but
+                            // the frames themselves are authoritative.
+                            if params.sample_rate != Some(first_header.sample_rate()) {
+                                debug!("wav (mpeg): format chunk sample rate differs from frame");
+                                params.with_sample_rate(first_header.sample_rate());
+                            }
+                        }
+
+                        // Determine the track length. For seekable streams, walk the frame
+                        // headers for an exact count. If the data chunk length is unknown (e.g. a
+                        // streaming WAVE where the data chunk is the last chunk), use the end of
+                        // the media source as the boundary. Clamp to the actual source length so
+                        // a truncated final frame does not fail probing. Otherwise fall back to
+                        // the Fact chunk.
+                        let data_len = data.len.map(u64::from).or_else(|| {
+                            mss.byte_len().map(|len| len.saturating_sub(data_start_pos))
+                        });
+
+                        if let Some(declared_len) = data_len {
+                            if mss.is_seekable() {
+                                let data_len = mss
+                                    .byte_len()
+                                    .map(|len| declared_len.min(len.saturating_sub(data_start_pos)))
+                                    .unwrap_or(declared_len);
+
+                                let num_frames = MpegPacketizer::count_samples(&mut mss, data_len)?;
+
+                                if num_frames > 0 {
+                                    track.with_num_frames(num_frames);
+                                    track.with_duration(Duration::from(num_frames));
+                                }
+                            }
+                        }
+
+                        // Append Fact chunk fields to the track, but do not overwrite an exact
+                        // frame count obtained above.
+                        if track.num_frames.is_none() {
+                            if let Some(fact) = &fact {
+                                append_fact_params(&mut track, fact);
+                                track.with_duration(Duration::from(fact.num_frames));
+                            }
+                        }
+
+                        // Instantiate the reader.
+                        return Ok(WavReader {
+                            reader: mss,
+                            media_info: MediaInfo::from_track(&track),
+                            tracks: vec![track],
+                            chapters: opts.external_data.chapters,
+                            metadata: opts.external_data.metadata.unwrap_or_default(),
+                            packet_info: None,
+                            mpeg_packetizer: Some(packetizer),
+                            data_start_pos,
+                            data_end_pos,
+                        });
+                    }
+
                     let Some(packet_info) = packet_info
                     else {
                         return decode_error("wav: missing format chunk");
@@ -171,7 +263,8 @@ impl<'s> WavReader<'s> {
                         tracks: vec![track],
                         chapters: opts.external_data.chapters,
                         metadata: opts.external_data.metadata.unwrap_or_default(),
-                        packet_info,
+                        packet_info: Some(packet_info),
+                        mpeg_packetizer: None,
                         data_start_pos,
                         data_end_pos,
                     });
@@ -228,9 +321,17 @@ impl FormatReader for WavReader<'_> {
     }
 
     fn next_packet(&mut self) -> Result<Option<Packet>> {
+        // MPEG audio streams are packetized by frame re-sync.
+        if let Some(packetizer) = &mut self.mpeg_packetizer {
+            return packetizer.next_packet(&mut self.reader);
+        }
+
+        let packet_info =
+            self.packet_info.as_ref().expect("non-mpeg streams must have packet info");
+
         next_packet(
             &mut self.reader,
-            &self.packet_info,
+            packet_info,
             &self.tracks,
             self.data_start_pos,
             self.data_end_pos.unwrap_or(u64::MAX),
@@ -284,17 +385,30 @@ impl FormatReader for WavReader<'_> {
 
         debug!("seeking to frame_ts={required_ts}");
 
+        // MPEG audio frames do not have a fixed byte size, so seek by re-syncing from the start of
+        // the data chunk.
+        if let Some(packetizer) = &mut self.mpeg_packetizer {
+            if !self.reader.is_seekable() {
+                return seek_error(SeekErrorKind::ForwardOnly);
+            }
+
+            return packetizer.seek(&mut self.reader, required_ts);
+        }
+
+        let packet_info =
+            self.packet_info.as_ref().expect("non-mpeg streams must have packet info");
+
         // WAVE is not internally packetized for PCM codecs. Packetization is simulated by trying to
         // read a constant number of samples or blocks every call to next_packet. Therefore, a
         // packet begins wherever the data stream is currently positioned. Since timestamps on
         // packets should be determinstic, instead of seeking to the exact timestamp requested and
         // starting the next packet there, seek to a packet boundary. In this way, packets will have
         // the same timestamps regardless if the stream was seeked or not.
-        let actual_ts = self.packet_info.get_actual_ts(required_ts);
+        let actual_ts = packet_info.get_actual_ts(required_ts);
 
         // Calculate the absolute byte offset of the desired audio frame.
         let seek_pos =
-            self.data_start_pos + (actual_ts.get() as u64 * self.packet_info.block_size.get());
+            self.data_start_pos + (actual_ts.get() as u64 * packet_info.block_size.get());
 
         // If the reader supports seeking we can seek directly to the frame's offset wherever it may
         // be.

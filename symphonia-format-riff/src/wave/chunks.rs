@@ -11,7 +11,7 @@ use symphonia_core::audio::AmbisonicBFormat;
 use symphonia_core::audio::{ChannelLabel, Channels, Position};
 use symphonia_core::codecs::audio::AudioCodecId;
 use symphonia_core::codecs::audio::well_known::{
-    CODEC_ID_ADPCM_IMA_WAV, CODEC_ID_ADPCM_MS, CODEC_ID_PCM_ALAW, CODEC_ID_PCM_F32LE,
+    CODEC_ID_ADPCM_IMA_WAV, CODEC_ID_ADPCM_MS, CODEC_ID_MP3, CODEC_ID_PCM_ALAW, CODEC_ID_PCM_F32LE,
     CODEC_ID_PCM_F64LE, CODEC_ID_PCM_MULAW, CODEC_ID_PCM_S16LE, CODEC_ID_PCM_S24LE,
     CODEC_ID_PCM_S32LE, CODEC_ID_PCM_U8,
 };
@@ -24,7 +24,8 @@ use symphonia_metadata::embedded::riff;
 
 use crate::common::{
     ByteOrder, ChunkParser, ChunksReader, FormatALaw, FormatAdpcm, FormatData, FormatExtensible,
-    FormatIeeeFloat, FormatMuLaw, FormatPcm, NullChunks, PacketInfo, ParseChunk, ParseChunkTag,
+    FormatIeeeFloat, FormatMpeg, FormatMuLaw, FormatPcm, NullChunks, PacketInfo, ParseChunk,
+    ParseChunkTag,
 };
 
 use log::info;
@@ -259,6 +260,28 @@ impl WaveFormatChunk {
             0x03, 0x00, 0x00, 0x00, 0x21, 0x07, 0xd3, 0x11,
             0x86, 0x44, 0xc8, 0xc1, 0xca, 0x00, 0x00, 0x00,
         ];
+        // The MPEGLAYER3 sub-type GUID. The first 2 bytes mirror the WAVE_FORMAT_MPEGLAYER3 format
+        // tag (0x0055); the remainder is the standard sub-type base.
+        #[rustfmt::skip]
+        const KSDATAFORMAT_SUBTYPE_MPEGLAYER3: [u8; 16] = [
+            0x55, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+            0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+        ];
+
+        // MPEG layer-3 audio may also be signalled through the Extensible format with the
+        // MPEGLAYER3 sub-type GUID. Such streams are self-framing in the data chunk, so return the
+        // same MPEG format data used for the plain format tags.
+        if sub_format_guid == KSDATAFORMAT_SUBTYPE_MPEGLAYER3 {
+            // Fix the channel mask if it is invalid for the stated number of channels.
+            let channel_mask = fix_wave_channel_mask(channel_mask, num_channels);
+
+            let channels = match Position::from_wave_channel_mask(channel_mask) {
+                Some(positions) => Channels::Positioned(positions),
+                _ => return unsupported_error("wav: too many channels in mask for fmt_ext"),
+            };
+
+            return Ok(FormatData::Mpeg(FormatMpeg { channels, codec: CODEC_ID_MP3 }));
+        }
 
         // Verify support based on the format GUID.
         let codec = match sub_format_guid {
@@ -396,6 +419,45 @@ impl WaveFormatChunk {
         Ok(FormatData::MuLaw(FormatMuLaw { codec: CODEC_ID_PCM_MULAW, channels }))
     }
 
+    /// Parse a Format chunk for an MPEG audio stream (WAVE_FORMAT_MPEG or WAVE_FORMAT_MPEGLAYER3).
+    ///
+    /// The MPEG format tags only describe the container-level framing. The actual MPEG layer
+    /// (codec), bitrate, and sample rate are detected from the first frame in the data chunk, so
+    /// the format-specific extension data is simply consumed and discarded.
+    fn read_mpeg_fmt<B: ReadBytes>(
+        reader: &mut B,
+        num_channels: u16,
+        len: u32,
+    ) -> Result<FormatData> {
+        // A WAVEFORMATEX header with at least the extension data length field is required.
+        if len < 18 {
+            return decode_error("wav: malformed fmt_mpeg chunk");
+        }
+
+        let extra_size = reader.read_u16()?;
+
+        // The declared extension data must fit inside the Format chunk.
+        if u32::from(extra_size) > len - 18 {
+            return decode_error("wav: malformed fmt_mpeg chunk");
+        }
+
+        // Consume the format-specific extension data (e.g. the MPEG1WAVEFORMAT or
+        // MPEGLAYER3WAVEFORMAT fields). None of it is needed to decode the stream.
+        reader.ignore_bytes(u64::from(extra_size))?;
+
+        // Consume any trailing padding so the full chunk is read.
+        let trailing = len - 18 - u32::from(extra_size);
+        if trailing > 0 {
+            reader.ignore_bytes(u64::from(trailing))?;
+        }
+
+        let channels = map_wave_channel_count(num_channels)?;
+
+        // The MPEGLAYER3 tag always identifies layer 3 audio. The generic MPEG tag may carry any
+        // layer, so the codec is re-confirmed against the first frame while packetizing.
+        Ok(FormatData::Mpeg(FormatMpeg { channels, codec: CODEC_ID_MP3 }))
+    }
+
     pub(crate) fn packet_info(&self) -> Result<PacketInfo> {
         match &self.format_data {
             FormatData::Pcm(pcm) => pcm.make_packet_info(),
@@ -404,6 +466,11 @@ impl WaveFormatChunk {
             FormatData::ALaw(alaw) => alaw.make_packet_info(),
             FormatData::MuLaw(mulaw) => mulaw.make_packet_info(),
             FormatData::Extensible(ext) => ext.make_packet_info(),
+            // MPEG streams are packetized by re-syncing to each frame, so the block-based
+            // packetization information does not apply.
+            FormatData::Mpeg(_) => {
+                unreachable!("mpeg streams do not use block-based packetization")
+            }
         }
     }
 }
@@ -431,6 +498,8 @@ impl ParseChunk for WaveFormatChunk {
         const WAVE_FORMAT_ALAW: u16 = 0x0006;
         const WAVE_FORMAT_MULAW: u16 = 0x0007;
         const WAVE_FORMAT_ADPCM_IMA: u16 = 0x0011;
+        const WAVE_FORMAT_MPEG: u16 = 0x0050;
+        const WAVE_FORMAT_MPEGLAYER3: u16 = 0x0055;
         const WAVE_FORMAT_EXTENSIBLE: u16 = 0xfffe;
 
         let format_data = match format {
@@ -468,6 +537,11 @@ impl ParseChunk for WaveFormatChunk {
                 len,
                 CODEC_ID_ADPCM_IMA_WAV,
             ),
+            // MPEG audio, including the layer-3 variant produced by common encoders such as the
+            // ACM MP3 codec and ffmpeg.
+            WAVE_FORMAT_MPEG | WAVE_FORMAT_MPEGLAYER3 => {
+                Self::read_mpeg_fmt(reader, num_channels, len)
+            }
             // Unsupported format.
             _ => return unsupported_error("wav: unsupported wave format"),
         }?;
@@ -527,6 +601,11 @@ impl fmt::Display for WaveFormatChunk {
                 writeln!(f, "\tformat_data: MuLaw {{")?;
                 writeln!(f, "\t\tchannels: {},", mulaw.channels)?;
                 writeln!(f, "\t\tcodec: {},", mulaw.codec)?;
+            }
+            FormatData::Mpeg(ref mpeg) => {
+                writeln!(f, "\tformat_data: Mpeg {{")?;
+                writeln!(f, "\t\tchannels: {},", mpeg.channels)?;
+                writeln!(f, "\t\tcodec: {},", mpeg.codec)?;
             }
         };
 
