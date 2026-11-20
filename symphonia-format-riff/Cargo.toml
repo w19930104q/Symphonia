@@ -29,5 +29,8 @@ path = "../symphonia-metadata"
 default-features = false
 features = []
 
+[dev-dependencies]
+symphonia-codec-pcm = { version = "0.6.1", path = "../symphonia-codec-pcm" }
+
 [lints]
 workspace = true

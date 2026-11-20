@@ -94,18 +94,23 @@ impl<'s> WavReader<'s> {
             ChunksReader::<RiffWaveChunks>::new(riff_data_len, ByteOrder::LittleEndian);
 
         let mut codec_params = AudioCodecParameters::new();
-        let mut metadata: MetadataLog = Default::default();
+        // Metadata revisions parsed from LIST/INFO chunks contained within the RIFF chunk.
+        let mut container_metadata: MetadataLog = Default::default();
         let mut packet_info = None;
         let mut fact = None;
+
+        // The bounds of the data chunk, if found.
+        let mut data_start_pos = None;
+        let mut data_len = None;
+
+        let is_seekable = mss.is_seekable();
 
         loop {
             let chunk = riff_chunks.next(&mut mss)?;
 
-            // The last chunk should always be a data chunk, if it is not, then the stream is
-            // unsupported.
             let Some(chunk) = chunk
             else {
-                return unsupported_error("wav: missing data chunk");
+                break;
             };
 
             match chunk {
@@ -133,51 +138,98 @@ impl<'s> WavReader<'s> {
                     // Riff Lists can have many different forms, but WavReader only supports Info
                     // lists.
                     match &list.form {
-                        b"INFO" => metadata.push(read_info_chunk(&mut mss, list.len)?),
+                        b"INFO" => {
+                            let revision = read_info_chunk(&mut mss, list.len)?;
+
+                            // Do not add empty revisions.
+                            if !revision.media.tags.is_empty()
+                                || !revision.media.visuals.is_empty()
+                                || !revision.per_track.is_empty()
+                            {
+                                container_metadata.push(revision);
+                            }
+                        }
                         _ => list.skip(&mut mss)?,
                     }
                 }
                 RiffWaveChunks::Data(dat) => {
                     let data = dat.parse(&mut mss)?;
 
+                    // Only a single data chunk is supported. If another data chunk is encountered
+                    // after the first one, end the chunk scan here. The first data chunk's bounds
+                    // were already recorded and will be used for packetization and seeking.
+                    if data_start_pos.is_some() {
+                        break;
+                    }
+
                     // Record the bounds of the data chunk.
-                    let data_start_pos = mss.pos();
-                    let data_end_pos = data.len.map(|len| data_start_pos + u64::from(len));
+                    data_start_pos = Some(mss.pos());
+                    data_len = data.len;
 
-                    // Create the track.
-                    let mut track = Track::new(0);
-
-                    track.with_codec_params(CodecParameters::Audio(codec_params));
-
-                    let Some(packet_info) = packet_info
-                    else {
-                        return decode_error("wav: missing format chunk");
-                    };
-
-                    // Append Fact chunk fields to track.
-                    if let Some(fact) = &fact {
-                        append_fact_params(&mut track, fact);
+                    // If the media source is not seekable, it is not possible to scan for chunks
+                    // past the data chunk. Likewise, if the length of the data chunk is unknown
+                    // (streaming WAVE), it cannot be skipped over.
+                    if !is_seekable || data.len.is_none() {
+                        break;
                     }
 
-                    // Append Data chunk fields to track.
-                    if let Some(data_len) = data.len {
-                        append_data_params(&mut track, u64::from(data_len), &packet_info);
-                    }
-
-                    // Instantiate the reader.
-                    return Ok(WavReader {
-                        reader: mss,
-                        media_info: MediaInfo::from_track(&track),
-                        tracks: vec![track],
-                        chapters: opts.external_data.chapters,
-                        metadata: opts.external_data.metadata.unwrap_or_default(),
-                        packet_info,
-                        data_start_pos,
-                        data_end_pos,
-                    });
+                    // Skip over the audio data so chunks following the data chunk are scanned.
+                    mss.ignore_bytes(u64::from(data.len.expect("data length is known")))?;
                 }
             }
         }
+
+        // The data chunk is mandatory.
+        let data_start_pos = data_start_pos.ok_or(Error::Unsupported("wav: missing data chunk"))?;
+
+        // If the scan continued past the data chunk, seek back to the start of the audio data so
+        // packetization begins at the correct position. A non-seekable source always terminates the
+        // scan at the first data chunk, so the stream is already positioned correctly.
+        if is_seekable {
+            mss.seek(SeekFrom::Start(data_start_pos))?;
+        }
+        else {
+            debug_assert_eq!(mss.pos(), data_start_pos);
+        }
+
+        let data_end_pos = data_len.map(|len| data_start_pos + u64::from(len));
+
+        // Create the track.
+        let mut track = Track::new(0);
+
+        track.with_codec_params(CodecParameters::Audio(codec_params));
+
+        let Some(packet_info) = packet_info
+        else {
+            return decode_error("wav: missing format chunk");
+        };
+
+        // Append Fact chunk fields to track.
+        if let Some(fact) = &fact {
+            append_fact_params(&mut track, fact);
+        }
+
+        // Append Data chunk fields to track.
+        if let Some(data_len) = data_len {
+            append_data_params(&mut track, u64::from(data_len), &packet_info);
+        }
+
+        // External metadata (e.g. an ID3v2 tag preceding the RIFF chunk) takes precedence and forms
+        // the first revisions, followed by the metadata revisions parsed from the container itself.
+        let mut metadata = opts.external_data.metadata.unwrap_or_default();
+        metadata.append(&mut container_metadata);
+
+        // Instantiate the reader.
+        Ok(WavReader {
+            reader: mss,
+            media_info: MediaInfo::from_track(&track),
+            tracks: vec![track],
+            chapters: opts.external_data.chapters,
+            metadata,
+            packet_info,
+            data_start_pos,
+            data_end_pos,
+        })
     }
 }
 
