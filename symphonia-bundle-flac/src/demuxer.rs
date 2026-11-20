@@ -32,6 +32,12 @@ use super::parser::PacketParser;
 /// The FLAC start of stream marker: "fLaC" in ASCII.
 const FLAC_STREAM_MARKER: [u8; 4] = *b"fLaC";
 
+/// The length of an ID3v1 tag.
+const ID3V1_TAG_LEN: u64 = 128;
+
+/// The length of an APE tag footer (or header).
+const APE_FOOTER_LEN: u64 = 32;
+
 const FLAC_FORMAT_INFO: FormatInfo = FormatInfo {
     format: FORMAT_ID_FLAC,
     short_name: "flac",
@@ -48,6 +54,7 @@ pub struct FlacReader<'s> {
     metadata: MetadataLog,
     index: Option<SeekIndex>,
     first_frame_offset: u64,
+    end_of_stream: Option<u64>,
     parser: PacketParser,
 }
 
@@ -177,6 +184,23 @@ impl<'s> FlacReader<'s> {
         let mut metadata = opts.external_data.metadata.unwrap_or_default();
         metadata.push(metadata_builder.build());
 
+        // If the stream is seekable, scan the end of the stream for trailing tags such as ID3v1
+        // and APEv2. If any are found, limit the packet parser to the audio stream so that the
+        // trailing tags are not mistaken for audio data, and the final frame of the stream is
+        // demuxed.
+        let end_of_stream = if reader.is_seekable() {
+            let pos = reader.pos();
+            let end_of_stream = scan_trailing_tags(&mut reader)?;
+            reader.seek(SeekFrom::Start(pos))?;
+
+            end_of_stream
+        }
+        else {
+            None
+        };
+
+        parser.set_end_of_stream(end_of_stream);
+
         // Synchronize the packet parser to the first audio frame.
         let _ = parser.resync(&mut reader)?;
 
@@ -193,9 +217,67 @@ impl<'s> FlacReader<'s> {
             metadata,
             index,
             first_frame_offset,
+            end_of_stream,
             parser,
         })
     }
+}
+
+/// Scans the end of the stream for trailing ID3v1 and APE (APEv1/APEv2) tags. Returns the stream
+/// position of the end of the audio stream if any trailing tags were found, or `None` otherwise.
+///
+/// The reader must be seekable. On return, the position of the reader is unspecified.
+fn scan_trailing_tags(reader: &mut MediaSourceStream<'_>) -> Result<Option<u64>> {
+    let stream_end = reader.seek(SeekFrom::End(0))?;
+    let mut end = stream_end;
+
+    // Tags may be chained. For example, an APEv2 tag followed by an ID3v1 tag. Therefore, loop
+    // until no more tags are found.
+    loop {
+        // An ID3v1 tag is the last 128 bytes of the stream, and starts with the ASCII marker
+        // "TAG".
+        if end >= ID3V1_TAG_LEN {
+            reader.seek(SeekFrom::Start(end - ID3V1_TAG_LEN))?;
+
+            if reader.read_triple_bytes()? == *b"TAG" {
+                end -= ID3V1_TAG_LEN;
+                continue;
+            }
+        }
+
+        // An APE tag footer is the last 32 bytes of the tag, and starts with the ASCII preamble
+        // "APETAGEX".
+        if end >= APE_FOOTER_LEN {
+            reader.seek(SeekFrom::Start(end - APE_FOOTER_LEN))?;
+
+            let mut preamble = [0u8; 8];
+            reader.read_buf_exact(&mut preamble)?;
+
+            if preamble == *b"APETAGEX" {
+                let version = reader.read_u32()?;
+                let size = u64::from(reader.read_u32()?);
+                let _item_count = reader.read_u32()?;
+                let flags = reader.read_u32()?;
+
+                // The size does not include the 32-byte header. For APEv2 tags, a header is
+                // present if bit 31 of the flags is set. APEv1 tags never have a header.
+                let has_header = version != 1000 && flags & 0x8000_0000 != 0;
+
+                let tag_len = size + if has_header { APE_FOOTER_LEN } else { 0 };
+
+                // The size must atleast contain the footer, and the whole tag must fit before
+                // the current end of stream for the tag to be considered valid.
+                if size >= APE_FOOTER_LEN && tag_len <= end {
+                    end -= tag_len;
+                    continue;
+                }
+            }
+        }
+
+        break;
+    }
+
+    Ok((end < stream_end).then_some(end))
 }
 
 impl Scoreable for FlacReader<'_> {
@@ -288,9 +370,13 @@ impl FormatReader for FlacReader<'_> {
             // The range formed by start_byte_offset..end_byte_offset defines an area where the
             // binary search for the packet containing the desired timestamp will be performed. The
             // lower bound is set to the byte offset of the first frame, while the upper bound is
-            // set to the length of the stream.
+            // set to the end of the audio stream (which may be before the end of the underlying
+            // stream if there are trailing tags).
             let mut start_byte_offset = self.first_frame_offset;
-            let mut end_byte_offset = self.reader.seek(SeekFrom::End(0))?;
+            let mut end_byte_offset = match self.end_of_stream {
+                Some(end) => end,
+                None => self.reader.seek(SeekFrom::End(0))?,
+            };
 
             // If there is an index, use it to refine the binary search range.
             if let Some(ref index) = self.index {

@@ -306,6 +306,9 @@ pub struct PacketParser {
     fsma: MovingAverage<4>,
     /// Packet builder.
     builder: PacketBuilder,
+    /// The stream position at which the audio stream ends. If `None`, the audio stream extends
+    /// to the end of the underlying stream.
+    end_of_stream: Option<u64>,
 }
 
 impl PacketParser {
@@ -333,8 +336,19 @@ impl PacketParser {
         // read to synchronize to the next frame header.
         let init_read_size = avg_frame_size.clamp(1024, 32768) + FLAC_MAX_FRAME_HEADER_SIZE;
 
+        // If the end of the audio stream is known (for example, because the stream has trailing
+        // tags such as ID3v1 or APEv2), then do not read past it.
+        let max_len = self.end_of_stream.map_or(usize::MAX, |end| {
+            usize::try_from(end.saturating_sub(reader.pos())).unwrap_or(usize::MAX)
+        });
+
+        // The reader is at the end of the audio stream. Return an end-of-stream error.
+        if max_len == 0 {
+            return Err(Error::IoError(std::io::ErrorKind::UnexpectedEof.into()));
+        }
+
         // Buffer in which the fragment will be read.
-        let mut buf: Vec<u8> = vec![0; init_read_size];
+        let mut buf: Vec<u8> = vec![0; init_read_size.min(max_len)];
 
         // Do the initial read.
         //
@@ -390,9 +404,15 @@ impl PacketParser {
                 return Ok(None);
             }
 
+            // If the end of the audio stream was reached, then no further frame headers can be
+            // found. Stop reading and return the fragment as-is.
+            if end >= max_len {
+                break 'found end;
+            }
+
             // Calculate the required buffer size after reading a new 1kB chunk of data, and grow
-            // the buffer if necessary.
-            let next_read_end = end + 1024;
+            // the buffer if necessary. Do not read past the end of the audio stream.
+            let next_read_end = (end + 1024).min(max_len);
 
             if next_read_end > buf.len() {
                 buf.resize(next_read_end, 0);
@@ -560,6 +580,13 @@ impl PacketParser {
         self.info = info;
         self.builder.set_max_frame_size(max_frame_size);
         self.soft_reset();
+    }
+
+    /// Set the stream position at which the audio stream ends. Any data at, or after, this
+    /// position (for example, trailing ID3v1 or APEv2 tags) will not be read by the parser. If
+    /// `None`, the audio stream extends to the end of the underlying stream.
+    pub fn set_end_of_stream(&mut self, end_of_stream: Option<u64>) {
+        self.end_of_stream = end_of_stream;
     }
 }
 
